@@ -1,0 +1,34 @@
+# Dépendances du projet Sparse VAE Forgery Detection
+# CDC § Stack Technique
+
+# Core ML Framework
+torch>=2.0.0
+torchvision>=0.15.0
+pytorch-lightning>=2.0.0
+
+# Vision & Feature Extraction
+timm>=0.9.0          # Pour DINOv2 (potentiel)
+transformers>=4.30.0 # Pour accès DINOv2
+
+# Perte et Métriques
+kornia>=0.7.0        # SSIM loss
+scikit-learn>=1.3.0  # Métriques (AUC-ROC, F1, etc.)
+
+# Visualisation et Traitement d'Image
+opencv-python>=4.8.0 # cv2
+matplotlib>=3.7.0    # Visualisation
+Pillow>=10.0.0       # Image loading
+
+# Utilitaires
+numpy>=1.24.0
+scipy>=1.11.0        # gaussian_filter, ndimage
+pyyaml>=6.0          # Config YAML
+
+# Expérimentation (optionnel)
+wandb>=0.15.0        # Experiment tracking
+tensorboard>=2.13.0  # Alternative logging
+
+# Développement (optionnel)
+pytest>=7.4.0        # Testing
+black>=23.0.0        # Code formatting
+flake8>=6.0.0        # Linting

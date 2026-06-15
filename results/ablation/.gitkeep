@@ -1,0 +1,2 @@
+# results/ablation/ — Résultats des runs d'ablation
+# Les fichiers JSON seront générés par train.py et evaluate.py

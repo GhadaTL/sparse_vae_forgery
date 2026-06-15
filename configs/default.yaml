@@ -1,0 +1,47 @@
+# CDC § Configuration complète
+# Hyperparamètres du modèle et de l'entraînement
+
+# ── Architecture ──────────────────────────────────────────────────────────────
+latent_dim: 64              # Dimensionalité de l'espace latent z
+k: 16                       # Top-K pour sparsité (de 64 dims)
+dropout: 0.1                # Taux de dropout ProjectionHead
+logvar_clamp: [-4.0, 4.0]   # Clamping pour log(variance)
+
+# ── Optimisation ──────────────────────────────────────────────────────────────
+batch_size: 32              # CDC §5.2 — taille du batch
+lr: 1.0e-4                  # Taux d'apprentissage Adam (ProjectionHead + Decoder)
+wd: 1.0e-4                  # Weight decay L2
+epochs: 100                 # Nombre max d'epochs
+patience: 15                # Early stopping patience (CDC §5.2)
+
+# ── Perte multi-échelle ───────────────────────────────────────────────────────
+# CDC §4.3 — L_recon = α·L_coarse + β·L_medium + γ·L_fine
+alpha: 0.1                  # Poids L_coarse (16×16)
+lambda_m: 0.3               # Poids L_medium (32×32)
+lambda_f: 0.6               # Poids L_fine (64×64)
+
+# ── Composante SSIM ───────────────────────────────────────────────────────────
+# L_recon per scale = (1-epsilon)·MSE + epsilon·(1-SSIM)
+epsilon: 0.2                # Poids SSIM vs MSE (CDC §4.3)
+
+# ── KL Annealing (β) ──────────────────────────────────────────────────────────
+# CDC §5.4 — Protocole 3 phases
+# Phase 1 (epoch 1-20)   : β = 0
+# Phase 2 (epoch 21-50)  : β linéaire 0 → β_max
+# Phase 3 (epoch 51-100) : β = β_max (fixé)
+beta_max: 4.0               # Valeur max de β en Phase 3
+
+# ── Données (MIDV-2020) ───────────────────────────────────────────────────────
+data_root: "data"           # Répertoire racine
+midv2020_train_ratio: 0.7   # 70% train / 30% val
+train_split: 0.7
+val_split: 0.3
+
+# ── Chemins de sortie ─────────────────────────────────────────────────────────
+checkpoint_dir: "checkpoints"   # Où sauvegarder les models
+results_dir: "results/ablation"  # Où sauvegarder les JSON de résultats
+
+# ── Grille ablation (optionnel — utilisé par ablation.py) ────────────────────
+# Ignored par train.py (qui accepte --k et --beta_max en CLI)
+k_values: [8, 16, 32]           # Valeurs de K à tester
+beta_max_values: [0.5, 1.0, 2.0, 4.0]  # Valeurs de β à tester
