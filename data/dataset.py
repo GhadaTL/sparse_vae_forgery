@@ -1,130 +1,101 @@
-# data/dataset.py
-# CDC § Datasets — Document Forgery Detection
-# À compléter : MIDV2020Dataset, FMIDV2022Dataset, etc.
-
 import torch
 from torch.utils.data import Dataset
+from torchvision import transforms
 from pathlib import Path
-from typing import Tuple, Optional, Literal
+from PIL import Image
+from typing import Literal, Tuple
+
+
+# ── Transform standard CDC §5.1 ───────────────────────────────────────────────
+DEFAULT_TRANSFORM = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                         std =[0.229, 0.224, 0.225]),
+])
 
 
 class MIDV2020Dataset(Dataset):
     """
-    MIDV-2020 Dataset — Images de documents authentiques.
-    
-    Splits:
-    - train (70%): Entraînement
-    - val (30%): Validation et calibration AnomalyScorer
-    
-    À IMPLÉMENTER par l'utilisateur.
+    MIDV-2020 — documents authentiques.
+
+    Structure attendue sur disque :
+        data/midv2020/
+            train/   *.jpg / *.png
+            val/     *.jpg / *.png
+
+    Label : 0 (authentique) pour tous les fichiers.
     """
-    
-    def __init__(self, split: Literal['train', 'val', 'test'] = 'train',
-                 root_dir: str = 'data/midv2020',
+
+    def __init__(self,
+                 split: Literal["train", "val"] = "train",
+                 root_dir: str = "data/midv2020",
                  transform=None):
-        """
-        Args:
-            split : 'train', 'val', ou 'test'
-            root_dir : chemin vers data/midv2020/
-            transform : transformations optionnelles (resize, normalize, etc.)
-        """
-        self.split = split
-        self.root_dir = Path(root_dir)
-        self.transform = transform
-        
-        # À IMPLÉMENTER : charger les images et labels
-        raise NotImplementedError(
-            "MIDV2020Dataset.__init__ — À implémenter avec chargement des images"
+
+        self.root_dir  = Path(root_dir) / split
+        self.transform = transform or DEFAULT_TRANSFORM
+        self.label     = 0
+
+        if not self.root_dir.exists():
+            raise FileNotFoundError(
+                f"Dossier introuvable : {self.root_dir}\n"
+                f"Crée la structure : data/midv2020/train/ et data/midv2020/val/"
+            )
+
+        self.image_paths = sorted(
+            list(self.root_dir.glob("*.jpg")) +
+            list(self.root_dir.glob("*.jpeg")) +
+            list(self.root_dir.glob("*.png"))
         )
-    
+
+        if len(self.image_paths) == 0:
+            raise RuntimeError(f"Aucune image trouvée dans {self.root_dir}")
+
     def __len__(self) -> int:
-        """À IMPLÉMENTER"""
-        raise NotImplementedError("MIDV2020Dataset.__len__")
-    
+        return len(self.image_paths)
+
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
-        """
-        À IMPLÉMENTER
-        
-        Returns:
-            image : torch.Tensor (3, 224, 224) — normalisée [0,1]
-            label : int — 0 (authentique)
-        """
-        raise NotImplementedError("MIDV2020Dataset.__getitem__")
+        img = Image.open(self.image_paths[idx]).convert("RGB")
+        return self.transform(img), self.label
 
 
 class FMIDV2022Dataset(Dataset):
     """
-    FMIDV-2022 Dataset — Images de documents avec manipulations (forgeries).
-    
-    Utilisé pour:
-    - Test AUC-ROC (evaluate.py)
-    - Évaluation AnomalyScorer
-    
-    À IMPLÉMENTER par l'utilisateur.
+    FMIDV-2022 — documents forgés.
+
+    Structure attendue sur disque :
+        data/fmidv2022/
+            *.jpg / *.png
+
+    Label : 1 (forgé) pour tous les fichiers.
     """
-    
-    def __init__(self, root_dir: str = 'data/fmidv2022', transform=None):
-        """
-        Args:
-            root_dir : chemin vers data/fmidv2022/
-            transform : transformations optionnelles
-        """
-        self.root_dir = Path(root_dir)
-        self.transform = transform
-        
-        # À IMPLÉMENTER : charger les images forgées et labels
-        raise NotImplementedError(
-            "FMIDV2022Dataset.__init__ — À implémenter avec chargement des images"
+
+    def __init__(self,
+                 root_dir: str = "data/fmidv2022",
+                 transform=None):
+
+        self.root_dir  = Path(root_dir)
+        self.transform = transform or DEFAULT_TRANSFORM
+        self.label     = 1
+
+        if not self.root_dir.exists():
+            raise FileNotFoundError(
+                f"Dossier introuvable : {self.root_dir}\n"
+                f"Crée la structure : data/fmidv2022/"
+            )
+
+        self.image_paths = sorted(
+            list(self.root_dir.glob("*.jpg")) +
+            list(self.root_dir.glob("*.jpeg")) +
+            list(self.root_dir.glob("*.png"))
         )
-    
+
+        if len(self.image_paths) == 0:
+            raise RuntimeError(f"Aucune image trouvée dans {self.root_dir}")
+
     def __len__(self) -> int:
-        """À IMPLÉMENTER"""
-        raise NotImplementedError("FMIDV2022Dataset.__len__")
-    
+        return len(self.image_paths)
+
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
-        """
-        À IMPLÉMENTER
-        
-        Returns:
-            image : torch.Tensor (3, 224, 224) — normalisée [0,1]
-            label : int — 1 (forgé)
-        """
-        raise NotImplementedError("FMIDV2022Dataset.__getitem__")
-
-
-class FantasyIDDataset(Dataset):
-    """
-    FantasyID Dataset — Cross-dataset evaluation.
-    
-    À IMPLÉMENTER si nécessaire pour ablation croisée.
-    """
-    
-    def __init__(self, root_dir: str = 'data/fantasyid', transform=None):
-        self.root_dir = Path(root_dir)
-        self.transform = transform
-        raise NotImplementedError("FantasyIDDataset — À implémenter")
-    
-    def __len__(self) -> int:
-        raise NotImplementedError()
-    
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
-        raise NotImplementedError()
-
-
-class SIDTDDataset(Dataset):
-    """
-    SIDTD Dataset — Cross-dataset evaluation.
-    
-    À IMPLÉMENTER si nécessaire pour ablation croisée.
-    """
-    
-    def __init__(self, root_dir: str = 'data/sidtd', transform=None):
-        self.root_dir = Path(root_dir)
-        self.transform = transform
-        raise NotImplementedError("SIDTDDataset — À implémenter")
-    
-    def __len__(self) -> int:
-        raise NotImplementedError()
-    
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
-        raise NotImplementedError()
+        img = Image.open(self.image_paths[idx]).convert("RGB")
+        return self.transform(img), self.label
