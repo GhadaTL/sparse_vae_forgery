@@ -94,3 +94,45 @@ def total_loss(
         "l_kl":     kl_loss,
         "beta":     beta,
     }
+
+
+def compute_sparsity_metrics(z_sparse: torch.Tensor, latent_dim: int = 64) -> dict:
+    """
+    Calcule métriques de sparsité pour feedback contrôleurs K et β.
+    
+    Args:
+        z_sparse : représentation latente clairsemée (B, latent_dim)
+        latent_dim : dimension de z
+    
+    Returns:
+        dict avec:
+        - sparsity_rate: % de zéros dans z_sparse ∈ [0, 1]
+        - active_ratio: % non-zéros ∈ [0, 1]
+        - n_collapsed: nombre dimensions totalement inactives dans le batch
+        - mean_active_per_sample: moyenne dims actives par sample
+        - n_active: nombre dimensions actives au moins une fois dans batch
+    
+    CDC §3.4 — Critères de sparsité
+    """
+    # Zéros dans batch entier
+    total_zeros = (z_sparse == 0).float().sum().item()
+    total_elements = z_sparse.numel()
+    sparsity_rate = total_zeros / total_elements
+    active_ratio = 1.0 - sparsity_rate
+    
+    # Dimensions avec activité zéro sur TOUS les samples (dimensions mortes)
+    dims_activity = (z_sparse.abs() > 1e-7).any(dim=0)  # (latent_dim,)
+    n_collapsed = (dims_activity == 0).sum().item()
+    n_active = dims_activity.sum().item()
+    
+    # Moyenne dims actives par sample
+    active_per_sample = (z_sparse.abs() > 1e-7).sum(dim=1).float()
+    mean_active_per_sample = active_per_sample.mean().item()
+    
+    return {
+        "sparsity_rate": float(sparsity_rate),
+        "active_ratio": float(active_ratio),
+        "n_collapsed": int(n_collapsed),
+        "n_active": int(n_active),
+        "mean_active_per_sample": float(mean_active_per_sample),
+    }
