@@ -1,138 +1,185 @@
+"""
+losses/total_loss.py
+====================
+Step ⑤ — Total loss
+MSE + SSIM multi-scale reconstruction + β-KL annealing (CDC §5)
+
+L_total = L_recon + β(t) × L_KL
+L_recon = 0.1×L_coarse + 0.3×L_medium + 0.6×L_fine
+L_x     = 0.8×MSE(x, x̂) + 0.2×(1 − SSIM(x, x̂))
+
+β schedule (3-phase — CDC §5.4):
+    Phase 1  epochs 1–phase1_end   : β = 0      (pure reconstruction)
+    Phase 2  phase1_end–phase2_end : β 0 → beta_max  (KL warm-up)
+    Phase 3  phase2_end+           : β = beta_max    (full training)
+
+NOTE: phase1_end, phase2_end, beta_max sont tous passés en paramètre
+depuis train.py via cfg — aucune valeur codée en dur ici.
+"""
+
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 
 try:
-    from kornia.losses import ssim_loss  # CDC §stack technique
+    from kornia.losses import ssim_loss as kornia_ssim
+    _KORNIA = True
 except ImportError:
-    ssim_loss = None
+    _KORNIA = False
 
 
-def _mse_per_scale(x: torch.Tensor, x_hat: torch.Tensor) -> torch.Tensor:
+# ──────────────────────────────────────────────────────────────
+# Per-scale helpers
+# ──────────────────────────────────────────────────────────────
+
+def _mse(x: torch.Tensor, x_hat: torch.Tensor) -> torch.Tensor:
     return F.mse_loss(x_hat, x, reduction="mean")
 
 
-def _ssim_per_scale(x: torch.Tensor, x_hat: torch.Tensor) -> torch.Tensor:
-    """1 - SSIM, via kornia. Fallback MSE si kornia absent."""
-    if ssim_loss is not None:
-        return ssim_loss(x_hat, x, window_size=7, reduction="mean")
-    return _mse_per_scale(x, x_hat)
+def _ssim_loss(x: torch.Tensor, x_hat: torch.Tensor) -> torch.Tensor:
+    """1 − SSIM via kornia. Falls back to MSE if kornia is absent."""
+    if _KORNIA:
+        return kornia_ssim(x_hat, x, window_size=7, reduction="mean")
+    return _mse(x, x_hat)
 
 
-def reconstruction_loss(
-    x_c: torch.Tensor, x_hat_c: torch.Tensor,
-    x_m: torch.Tensor, x_hat_m: torch.Tensor,
-    x_f: torch.Tensor, x_hat_f: torch.Tensor,
-    alpha: float = 0.8,
-    gamma: float = 0.2,
-    lam_c: float = 0.1,
-    lam_m: float = 0.3,
-    lam_f: float = 0.6,
-) -> dict:
+def scale_loss(x: torch.Tensor, x_hat: torch.Tensor,
+               alpha: float = 0.8, gamma: float = 0.2) -> torch.Tensor:
+    """L_x = alpha × MSE + gamma × (1 − SSIM)"""
+    return alpha * _mse(x, x_hat) + gamma * _ssim_loss(x, x_hat)
+
+
+# ──────────────────────────────────────────────────────────────
+# β schedule
+# ──────────────────────────────────────────────────────────────
+
+def beta_annealing(epoch:      int,
+                   phase1_end: int   = 20,
+                   phase2_end: int   = 50,
+                   beta_max:   float = 4.0) -> float:
     """
-    CDC §5.2 :
-      L_x = α·MSE(x, x̂) + γ·(1 - SSIM(x, x̂))
-      L_recon = λ_c·L_c + λ_m·L_m + λ_f·L_f
-    """
-    def scale_loss(x, xh):
-        return alpha * _mse_per_scale(x, xh) + gamma * _ssim_per_scale(x, xh)
+    3-phase β schedule (CDC §5.4).
 
-    l_c = scale_loss(x_c, x_hat_c)
-    l_m = scale_loss(x_m, x_hat_m)
-    l_f = scale_loss(x_f, x_hat_f)
+    epoch < phase1_end              : β = 0
+    phase1_end ≤ epoch < phase2_end : β linearly 0 → beta_max
+    epoch ≥ phase2_end              : β = beta_max
+
+    MODIF : les valeurs par défaut restent pour compatibilité,
+    mais train.py passe toujours phase1_end et phase2_end explicitement
+    depuis cfg — les défauts ne sont jamais utilisés en pratique.
+    """
+    if epoch < phase1_end:
+        return 0.0
+    if epoch < phase2_end:
+        progress = (epoch - phase1_end) / (phase2_end - phase1_end)
+        return beta_max * progress
+    return beta_max
+
+
+# ──────────────────────────────────────────────────────────────
+# Main loss function
+# ──────────────────────────────────────────────────────────────
+
+def total_loss(outputs:    dict,
+               epoch:      int,
+               alpha:      float = 0.8,
+               gamma:      float = 0.2,
+               lam_c:      float = 0.1,
+               lam_m:      float = 0.3,
+               lam_f:      float = 0.6,
+               beta_max:   float = 4.0,
+               phase1_end: int   = 20,
+               phase2_end: int   = 50) -> dict:
+    """
+    Compute total loss from the output dict of SparseVAE.forward().
+
+    Args
+        outputs    : dict returned by SparseVAE.forward()
+        epoch      : current epoch (for β scheduling)
+        alpha      : MSE weight inside each scale loss
+        gamma      : SSIM weight inside each scale loss
+        lam_c/m/f  : scale weights (coarse / medium / fine)
+        beta_max   : maximum β value          ← lu depuis cfg["model"]["beta_final"]
+        phase1_end : fin phase 1 (β=0)        ← lu depuis cfg["training"]["phase1_epochs"]
+        phase2_end : fin phase 2 (warm-up)    ← lu depuis cfg["training"]["phase1_epochs"]
+                                                           + cfg["training"]["phase2_epochs"]
+
+    Returns dict with:
+        loss        — total loss (backward on this)
+        l_recon     — reconstruction loss
+        l_coarse    — coarse scale loss
+        l_medium    — medium scale loss
+        l_fine      — fine scale loss
+        l_kl        — raw KL divergence
+        beta        — current β value
+    """
+    l_c = scale_loss(outputs["x_coarse"], outputs["x_hat_coarse"], alpha, gamma)
+    l_m = scale_loss(outputs["x_medium"], outputs["x_hat_medium"], alpha, gamma)
+    l_f = scale_loss(outputs["x_fine"],   outputs["x_hat_fine"],   alpha, gamma)
 
     l_recon = lam_c * l_c + lam_m * l_m + lam_f * l_f
 
-    return {
-        "l_recon": l_recon,
-        "l_coarse": l_c,
-        "l_medium": l_m,
-        "l_fine":   l_f,
-    }
-
-
-def beta_annealing(epoch: int,
-                   warmup_start: int = 20,
-                   warmup_end: int   = 50,
-                   beta_max: float   = 4.0) -> float:
-    """
-    CDC §5.2 et §5.4 — protocole 3 phases :
-      Phase 1 (epochs 1–20)  : β = 0  (reconstruction pure)
-      Phase 2 (epochs 21–50) : β 0→4  (KL warm-up linéaire)
-      Phase 3 (epochs 51+)   : β = 4  (entraînement complet)
-    """
-    if epoch < warmup_start:
-        return 0.0
-    elif epoch < warmup_end:
-        progress = (epoch - warmup_start) / (warmup_end - warmup_start)
-        return beta_max * progress
-    else:
-        return beta_max
-
-
-def total_loss(
-    x_c, x_hat_c,
-    x_m, x_hat_m,
-    x_f, x_hat_f,
-    kl_loss: torch.Tensor,
-    epoch:   int,
-) -> dict:
-    """
-    CDC §5.2 :
-      L_total = L_recon + β(t) × L_KL
-    """
-    recon = reconstruction_loss(x_c, x_hat_c, x_m, x_hat_m, x_f, x_hat_f)
-    beta  = beta_annealing(epoch)
-    loss  = recon["l_recon"] + beta * kl_loss
+    # MODIF : phase1_end et phase2_end passés explicitement — plus de valeurs codées en dur
+    beta  = beta_annealing(epoch,
+                           phase1_end=phase1_end,
+                           phase2_end=phase2_end,
+                           beta_max=beta_max)
+    l_kl  = outputs["kl"]
+    loss  = l_recon + beta * l_kl
 
     return {
         "loss":     loss,
-        "l_recon":  recon["l_recon"],
-        "l_coarse": recon["l_coarse"],
-        "l_medium": recon["l_medium"],
-        "l_fine":   recon["l_fine"],
-        "l_kl":     kl_loss,
+        "l_recon":  l_recon,
+        "l_coarse": l_c,
+        "l_medium": l_m,
+        "l_fine":   l_f,
+        "l_kl":     l_kl,
         "beta":     beta,
     }
 
 
-def compute_sparsity_metrics(z_sparse: torch.Tensor, latent_dim: int = 64) -> dict:
+# ──────────────────────────────────────────────────────────────
+# Sparsity metrics (CDC §3.4 — for controller feedback)
+# ──────────────────────────────────────────────────────────────
+
+def compute_sparsity_metrics(z_sparse: torch.Tensor) -> dict:
     """
-    Calcule métriques de sparsité pour feedback contrôleurs K et β.
-    
-    Args:
-        z_sparse : représentation latente clairsemée (B, latent_dim)
-        latent_dim : dimension de z
-    
-    Returns:
-        dict avec:
-        - sparsity_rate: % de zéros dans z_sparse ∈ [0, 1]
-        - active_ratio: % non-zéros ∈ [0, 1]
-        - n_collapsed: nombre dimensions totalement inactives dans le batch
-        - mean_active_per_sample: moyenne dims actives par sample
-        - n_active: nombre dimensions actives au moins une fois dans batch
-    
-    CDC §3.4 — Critères de sparsité
+    Compute sparsity diagnostics on a batch of z_sparse vectors.
+    Feed these into KController and BetaController.
+
+    Args
+        z_sparse : (B, latent_dim)
+
+    Returns dict with:
+        sparsity_rate         — fraction of zero entries across batch
+        active_ratio          — fraction of non-zero entries
+        n_collapsed           — dims with zero activity across ALL samples
+        n_active              — dims active at least once in the batch
+        mean_active_per_sample — mean active dims per sample
     """
-    # Zéros dans batch entier
-    total_zeros = (z_sparse == 0).float().sum().item()
+    total_zeros    = (z_sparse == 0).float().sum().item()
     total_elements = z_sparse.numel()
-    sparsity_rate = total_zeros / total_elements
-    active_ratio = 1.0 - sparsity_rate
-    
-    # Dimensions avec activité zéro sur TOUS les samples (dimensions mortes)
-    dims_activity = (z_sparse.abs() > 1e-7).any(dim=0)  # (latent_dim,)
-    n_collapsed = (dims_activity == 0).sum().item()
-    n_active = dims_activity.sum().item()
-    
-    # Moyenne dims actives par sample
-    active_per_sample = (z_sparse.abs() > 1e-7).sum(dim=1).float()
-    mean_active_per_sample = active_per_sample.mean().item()
-    
+    sparsity_rate  = total_zeros / total_elements
+    active_ratio   = 1.0 - sparsity_rate
+
+    dims_active = (z_sparse.abs() > 1e-7).any(dim=0)
+    n_collapsed = int((~dims_active).sum().item())
+    n_active    = int(dims_active.sum().item())
+    mean_active = (z_sparse.abs() > 1e-7).sum(dim=1).float().mean().item()
+
     return {
-        "sparsity_rate": float(sparsity_rate),
-        "active_ratio": float(active_ratio),
-        "n_collapsed": int(n_collapsed),
-        "n_active": int(n_active),
-        "mean_active_per_sample": float(mean_active_per_sample),
+        "sparsity_rate":          float(sparsity_rate),
+        "active_ratio":           float(active_ratio),
+        "n_collapsed":            n_collapsed,
+        "n_active":               n_active,
+        "mean_active_per_sample": float(mean_active),
     }
+
+
+# Backward-compatible alias
+def total_loss_fn(x, x_hat, beta=0.0, z_sparse=None):
+    """Compatibility shim for old train.py calls."""
+    l = F.mse_loss(x_hat, x)
+    sparsity = 0.0
+    if z_sparse is not None:
+        sparsity = compute_sparsity_metrics(z_sparse)["sparsity_rate"]
+    return l, sparsity

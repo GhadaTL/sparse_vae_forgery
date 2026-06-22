@@ -1,47 +1,91 @@
-# CDC § Configuration complète
-# Hyperparamètres du modèle et de l'entraînement
+# configs/default.yaml
+# Tous les hyperparamètres du projet sparse_vae_forgery
+# Référence : CDC §2–§7
 
-# ── Architecture ──────────────────────────────────────────────────────────────
-latent_dim: 64              # Dimensionalité de l'espace latent z
-k: 16                       # Top-K pour sparsité (de 64 dims)
-dropout: 0.1                # Taux de dropout ProjectionHead
-logvar_clamp: [-4.0, 4.0]   # Clamping pour log(variance)
+# ── Modèle ────────────────────────────────────────────────────
+model:
+  dinov2_name: "dinov2_vitb14"    # backbone DINOv2 (frozen)
+  latent_dim: 64                 # dim espace latent z
+  k: 32                            # Top-K sparsité initiale (k/latent_dim ≈ 6%)
+  dropout: 0.1                     # dropout ProjectionHead
+  logvar_clamp: [-4.0, 4.0]        # clamping log(σ²)
+  beta_final: 4.0                  # β max (phase 3)
+  beta_warmup_epochs: 20           # fin phase 1 (β=0)
 
-# ── Optimisation ──────────────────────────────────────────────────────────────
-batch_size: 32              # CDC §5.2 — taille du batch
-lr: 1.0e-4                  # Taux d'apprentissage Adam (ProjectionHead + Decoder)
-wd: 1.0e-4                  # Weight decay L2
-epochs: 100                 # Nombre max d'epochs
-patience: 15                # Early stopping patience (CDC §5.2)
+# ── Entraînement ──────────────────────────────────────────────
+training:
+  epochs: 100
+  batch_size: 32
+  lr: 1.0e-4                       # AdamW — ProjectionHead + Decoder
+  lr_min: 1.0e-6                   # eta_min CosineAnnealingLR
+  weight_decay: 1.0e-4
+  grad_clip_norm: 1.0              # clip_grad_norm
+  seed: 42
+  early_stopping_patience: 15
+  early_stopping_min_delta: 1.0e-5
+  phase1_epochs: 20                # reconstruction pure (β=0)
+  phase2_epochs: 30                # KL warm-up (β: 0→beta_final)
+  # phase 3 = epochs restants
 
-# ── Perte multi-échelle ───────────────────────────────────────────────────────
-# CDC §4.3 — L_recon = α·L_coarse + β·L_medium + γ·L_fine
-alpha: 0.1                  # Poids L_coarse (16×16)
-lambda_m: 0.3               # Poids L_medium (32×32)
-lambda_f: 0.6               # Poids L_fine (64×64)
+# ── Perte multi-échelle (CDC §4.3) ────────────────────────────
+loss:
+  lambda_coarse: 0.1               # poids échelle 16×16
+  lambda_medium: 0.3               # poids échelle 32×32
+  lambda_fine: 0.6                 # poids échelle 64×64
+  alpha: 0.8                       # poids MSE dans L_x
+  gamma: 0.2                       # poids (1−SSIM) dans L_x
 
-# ── Composante SSIM ───────────────────────────────────────────────────────────
-# L_recon per scale = (1-epsilon)·MSE + epsilon·(1-SSIM)
-epsilon: 0.2                # Poids SSIM vs MSE (CDC §4.3)
+# ── Contrôleurs adaptatifs (CDC §3.4, §5.4) ───────────────────
+adaptive:
+  enabled: true                    # false = schedule statique uniquement
 
-# ── KL Annealing (β) ──────────────────────────────────────────────────────────
-# CDC §5.4 — Protocole 3 phases
-# Phase 1 (epoch 1-20)   : β = 0
-# Phase 2 (epoch 21-50)  : β linéaire 0 → β_max
-# Phase 3 (epoch 51-100) : β = β_max (fixé)
-beta_max: 4.0               # Valeur max de β en Phase 3
+  # KController — signal KL
+  k_min: 3                         # K minimum absolu
+  k_max: 63                       # K maximum (< latent_dim pour garder sparsité)
+  k_tau_fraction: 0.1              # tau = tau_fraction × mean(kl_per_dim)
+  k_tau_min: 1.0e-4                # seuil absolu minimum (évite le bruit numérique)
+  k_ema_alpha: 0.7                 # lissage EMA (0.7 = réactif, 0.9 = lent)
+  k_ratio_min: 0.30                # active_ratio minimum autorisé
+  k_ratio_max: 0.70                # active_ratio maximum autorisé
 
-# ── Données (MIDV-2020) ───────────────────────────────────────────────────────
-data_root: "data"           # Répertoire racine
-midv2020_train_ratio: 0.7   # 70% train / 30% val
-train_split: 0.7
-val_split: 0.3
+  # KController — signal reconstruction
+  k_recon_loss_low: 0.5            # recon trop basse → réduire K (risque mémorisation)
+  k_recon_loss_high: 2.0           # recon trop haute → augmenter K (capacité insuffisante)
+  k_recon_step: 4                  # incrément/décrement K appliqué sur k_target
 
-# ── Chemins de sortie ─────────────────────────────────────────────────────────
-checkpoint_dir: "checkpoints"   # Où sauvegarder les models
-results_dir: "results/ablation"  # Où sauvegarder les JSON de résultats
+  # BetaController
+  target_sparsity: 0.85            # taux de zéros visé dans z_sparse
+  beta_step: 0.1                   # incrément/décrement β par epoch
 
-# ── Grille ablation (optionnel — utilisé par ablation.py) ────────────────────
-# Ignored par train.py (qui accepte --k et --beta_max en CLI)
-k_values: [8, 16, 32]           # Valeurs de K à tester
-beta_max_values: [0.5, 1.0, 2.0, 4.0]  # Valeurs de β à tester
+# ── Diagnostics ───────────────────────────────────────────────
+diagnostics:
+  kl_collapse_threshold: 2.0       # KL < seuil → posterior collapse
+  kl_explode_threshold: 10.0       # KL > seuil → espace latent non régularisé
+  active_ratio_min: 0.15           # active_ratio < seuil → trop de dims mortes
+  active_ratio_max: 0.85           # active_ratio > seuil → sparsité trop faible
+
+# ── Données ───────────────────────────────────────────────────
+data:
+  midv2020_path: "data/midv2020"
+  fmidv2022_path: "data/fmidv2022"
+  image_size: 224                  # entrée DINOv2 (patch 14×14 → 256 patches)
+  num_workers: 0
+  train_split: 0.7
+  val_split: 0.3
+
+# ── Évaluation (CDC §7) ───────────────────────────────────────
+evaluation:
+  anomaly_weights: [0.4, 0.2, 0.3, 0.1]   # [w_recon, w_kl, w_heatmap, w_latent]
+  heatmap_gaussian_sigma: 2.0
+  threshold_percentile: 95         # percentile sur val authentiques pour θ
+
+# ── Sorties ───────────────────────────────────────────────────
+output:
+  checkpoint_dir: "checkpoints"
+  results_dir: "results/res"
+  log_interval: 10
+
+# ── W&B (optionnel) ───────────────────────────────────────────
+wandb:
+  project: "sparse-vae-forgery"
+  enabled: false

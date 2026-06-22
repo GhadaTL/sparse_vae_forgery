@@ -1,108 +1,192 @@
+"""
+models/sparse_latent.py
+=======================
+Step ③ — Sparse Latent Space
+Reparametrization trick + Top-K hard sparsity + KL divergence
+Conforms to CDC §3
+
+Three operations in sequence:
+    1. Reparametrization : z = mu + sigma * eps   (differentiable sampling)
+    2. Top-K sparsity    : keep only K largest |z| dimensions, zero the rest
+    3. KL divergence     : -0.5 * sum(1 + logvar - mu^2 - exp(logvar))
+"""
+
 import torch
 import torch.nn as nn
 
 
-# =========================================================
-# TOP-K + STRAIGHT-THROUGH ESTIMATOR
-# =========================================================
+# ──────────────────────────────────────────────────────────────
+# 1. Reparametrization trick
+# ──────────────────────────────────────────────────────────────
 
-class TopKStraightThrough(torch.autograd.Function):
+def reparametrize(mu: torch.Tensor, logvar: torch.Tensor,
+                  training: bool = True, n_samples: int = 10) -> torch.Tensor:
+    """
+    z = mu + sigma * eps,   eps ~ N(0, I)
+
+    Differentiable w.r.t. mu and logvar via the reparametrization trick.
+    At inference: average of n_samples draws for stability (CDC §2.4).
+
+    Args
+        mu       : (B, latent_dim)
+        logvar   : (B, latent_dim)  — log sigma^2, clamped in [-4, 4]
+        training : True during training, False at inference
+        n_samples: number of MC samples averaged at inference
+
+    Returns
+        z : (B, latent_dim)
+    """
+    std = torch.exp(0.5 * logvar)
+
+    if training:
+        eps = torch.randn_like(std)
+        return mu + std * eps
+    else:
+        samples = [mu + std * torch.randn_like(std) for _ in range(n_samples)]
+        return torch.stack(samples).mean(dim=0)
+
+
+# ──────────────────────────────────────────────────────────────
+# 2. Top-K sparsity with straight-through estimator
+# ──────────────────────────────────────────────────────────────
+
+class _TopKStraightThrough(torch.autograd.Function):
+    """
+    Top-K hard sparsity with straight-through gradient estimator (CDC §3.2).
+
+    Forward  : keep K dims with largest |z|, zero the rest
+    Backward : gradient passes as if no mask was applied (STE)
+    """
 
     @staticmethod
-    def forward(ctx, z, k):
-        """
-        z: latent vector (B, D)
-        k: number of active dimensions
-        """
+    def forward(ctx, z: torch.Tensor, k: int):
         abs_z = z.abs()
         topk_vals, topk_idx = torch.topk(abs_z, k, dim=-1)
-
         mask = torch.zeros_like(z)
         mask.scatter_(-1, topk_idx, 1.0)
-
-        z_sparse = z * mask
         ctx.save_for_backward(mask)
-        return z_sparse
+        return z * mask, mask
 
     @staticmethod
-    def backward(ctx, grad_output):
-        """Straight-Through Estimator : gradient passe comme une identité."""
+    def backward(ctx, grad_z_sparse, grad_mask):
         mask, = ctx.saved_tensors
-        grad_input = grad_output * mask
-        return grad_input, None
+        return grad_z_sparse * mask, None
 
 
-# =========================================================
-# SPARSE LATENT MODULE  — avec reparameterization + KL
-# =========================================================
-
-class SparseLatent(nn.Module):
+def top_k_sparsity(z: torch.Tensor, k: int):
     """
-    Étape ③ du pipeline :
-        (mu, logvar) → reparameterization → Top-K sparsity → (z_sparse, kl_loss)
+    Apply Top-K hard sparsity to z.
 
-    Le KL est calculé analytiquement sur mu/logvar AVANT le masquage Top-K,
-    conformément à la pratique standard VAE (le masque est non-différentiable
-    et le STE ne propage pas de gradient vers logvar via le masque).
+    Args
+        z : (B, latent_dim)
+        k : number of active dimensions to keep
+
+    Returns
+        z_sparse : (B, latent_dim)  — k dims active, rest = 0
+        mask     : (B, latent_dim)  — binary float {0.0, 1.0}
+    """
+    k = max(1, min(int(k), z.size(-1)))
+    return _TopKStraightThrough.apply(z, k)
+
+
+# ──────────────────────────────────────────────────────────────
+# 3. KL divergence
+# ──────────────────────────────────────────────────────────────
+
+def kl_divergence(mu: torch.Tensor, logvar: torch.Tensor):
+    """
+    Analytical KL between q(z|x) = N(mu, sigma^2) and p(z) = N(0, I).
+
+    KL = -0.5 * sum_i (1 + logvar_i - mu_i^2 - exp(logvar_i))
+
+    Computed on the ORIGINAL z (before Top-K), as per CDC §3.3.
+
+    Returns
+        kl         : scalar        — mean over batch (pour la loss)
+        kl_per_dim : (latent_dim,) — mean over batch par dimension
+                     (pour le KController)
+    """
+    # (B, latent_dim) — contribution de chaque dimension pour chaque sample
+    kl_elementwise = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())
+
+    # moyenne sur le batch → (latent_dim,)
+    kl_per_dim = kl_elementwise.mean(dim=0)
+
+    # scalaire — somme sur les dimensions, cohérent avec l'ancienne formule
+    kl = kl_per_dim.sum()
+
+    return kl, kl_per_dim
+
+
+# ──────────────────────────────────────────────────────────────
+# 4. Full sparse latent layer (drop-in module)
+# ──────────────────────────────────────────────────────────────
+
+class SparseLatentLayer(nn.Module):
+    """
+    Complete sparse latent layer (CDC §3.5).
+
+    Chains:
+        reparametrize(mu, logvar)  → z
+        top_k_sparsity(z, k)       → z_sparse, mask
+        kl_divergence(mu, logvar)  → kl, kl_per_dim   (on z, not z_sparse)
+
+    Args
+        latent_dim : latent space dimension (default 64)
+        k          : number of active dimensions (default 16)
+        n_samples  : MC samples at inference (default 10)
     """
 
-    def __init__(self, latent_dim: int = 64, k: int = 16):
+    def __init__(self, latent_dim: int = 64, k: int = 16, n_samples: int = 10):
         super().__init__()
-        self.latent_dim  = latent_dim
-        self.k_default   = k
-        self.topk_fn     = TopKStraightThrough
+        self.latent_dim = latent_dim
+        self.k          = k
+        self.n_samples  = n_samples
 
-    # ------------------------------------------------------------------
-    def reparameterize(self, mu: torch.Tensor,
-                       logvar: torch.Tensor) -> torch.Tensor:
-        """z = mu + eps * std  (eps ~ N(0,I))."""
-        if self.training:
-            std = torch.exp(0.5 * logvar)
-            eps = torch.randn_like(std)
-            return mu + eps * std
-        return mu   # déterministe à l'inférence
-
-    # ------------------------------------------------------------------
-    def kl_loss(self, mu: torch.Tensor,
-                logvar: torch.Tensor) -> torch.Tensor:
+    def forward(self, mu: torch.Tensor, logvar: torch.Tensor):
         """
-        KL(q(z|x) || p(z)) analytique pour prior N(0,I).
-        = -0.5 * sum(1 + logvar - mu² - exp(logvar))
-        Retourne la moyenne sur le batch (scalaire).
-        """
-        kl = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())
-        return kl.sum(dim=1).mean()   # (B,D) → (B,) → scalaire
-
-    # ------------------------------------------------------------------
-    def forward(self, mu: torch.Tensor, logvar: torch.Tensor,
-                k: int = None):
-        """
-        Args:
+        Args
             mu     : (B, latent_dim)
             logvar : (B, latent_dim)
-            k      : nombre de dimensions actives (override k_default si fourni)
 
-        Returns:
-            z_sparse : (B, latent_dim)  — vecteur latent clairsemé
-            kl       : scalaire          — perte KL
-            mask     : (B, latent_dim)  — masque binaire Top-K
+        Returns
+            z_sparse   : (B, latent_dim)  sparse latent vector
+            kl         : scalar           KL loss term
+            kl_per_dim : (latent_dim,)    KL par dimension — pour KController
+            mask       : (B, latent_dim)  binary Top-K mask
         """
-        if k is None:
-            k = self.k_default
+        # 1. Sample z via reparametrization
+        z = reparametrize(mu, logvar, training=self.training,
+                          n_samples=self.n_samples)
 
-        # sécurité : k dans [1, latent_dim]
-        k = int(max(1, min(k, self.latent_dim)))
+        # 2. Apply Top-K sparsity (STE in backward)
+        z_sparse, mask = top_k_sparsity(z, self.k)
 
-        # 1. reparameterization trick
-        z = self.reparameterize(mu, logvar)
+        # 3. KL on z (not z_sparse — CDC §3.3)
+        kl, kl_per_dim = kl_divergence(mu, logvar)
 
-        # 2. KL avant masquage
-        kl = self.kl_loss(mu, logvar)
+        return z_sparse, kl, kl_per_dim, mask
 
-        # 3. Top-K sparsity avec STE
-        z_sparse = self.topk_fn.apply(z, k)
+    # ── LEA diagnostics (CDC §3.4) ────────────────────────────
 
-        # 4. reconstruire le masque (pour logging / contrôleurs)
-        mask = (z_sparse != 0).float()
+    def active_ratio(self, mask: torch.Tensor) -> float:
+        """Fraction of dimensions active on average. Target: ~k/latent_dim."""
+        return mask.float().mean().item()
 
-        return z_sparse, kl, mask
+    def sparsity_rate(self, mask: torch.Tensor) -> float:
+        """Fraction of dimensions zeroed."""
+        return 1.0 - self.active_ratio(mask)
+
+    def dead_dimensions(self, z_sparse: torch.Tensor,
+                        threshold: float = 0.001) -> int:
+        """Number of dimensions with variance below threshold across the batch."""
+        return (z_sparse.var(dim=0) < threshold).sum().item()
+
+    def lea_metrics(self, z_sparse: torch.Tensor,
+                    mask: torch.Tensor) -> dict:
+        """All LEA metrics in one call — log to W&B after each val epoch."""
+        return {
+            "latent/active_ratio":  self.active_ratio(mask),
+            "latent/sparsity_rate": self.sparsity_rate(mask),
+            "latent/dead_dims":     self.dead_dimensions(z_sparse),
+        }
