@@ -1,0 +1,104 @@
+# =============================================================================
+# Adaptive Sparse VAE — Identity Document Forgery Detection
+# Configuration Centrale — Tous les hyperparamètres ici
+# =============================================================================
+
+# --- Reproductibilité ---
+seed: 42
+
+# --- Données ---
+data:
+  image_size: 224          # Taille d'entrée DINOv2
+  midv2020_root: "data/midv2020"
+  fmidv2022_root: "data/fmidv2022"
+  train_split: 0.85        # 85% train, 15% val
+  num_workers: 4
+  pin_memory: true
+
+# --- DINOv2 ---
+dinov2:
+  model: "dinov2_vitb14"   # ViT-B/14 — frozen
+  patch_size: 14
+  num_patches: 256         # (224/14)^2
+  feature_dim: 768
+
+# --- Projection Head ---
+projection:
+  hidden_dim_1: 512
+  hidden_dim_2: 256
+  latent_dim: 64
+  dropout: 0.1
+  logvar_clamp_min: -4.0
+  logvar_clamp_max: 4.0
+
+# --- Sparse Latent / Adaptive K ---
+sparse:
+  latent_dim: 64
+  K_init: 8
+  K_min: 2
+  K_max: 50
+  ratio_min: 0.10          # K_min effectif = ratio_min * latent_dim = 6
+  ratio_max: 0.80          # K_max effectif = 50
+  tau_fraction: 0.1
+  tau_min: 1.0e-4
+  recon_loss_high: 0.05    # Seuil haut : augmenter K
+  recon_loss_low: 0.01     # Seuil bas : réduire K
+  recon_step: 2            # Pas d'adaptation de K
+  ema_alpha: 0.9           # EMA pour stabiliser K
+
+# --- Décodeur Multi-Échelle ---
+decoder:
+  init_channels: 8
+  proj_dim: 512
+  coarse_channels: 128     # Niveau 1 : 16×16
+  medium_channels: 64      # Niveau 2 : 32×32
+  fine_channels: 32        # Niveau 3 : 64×64
+
+# --- Loss ---
+loss:
+  # Poids MSE vs SSIM par échelle
+  alpha_mse: 0.8
+  gamma_ssim: 0.2
+  # Poids des échelles
+  lambda_coarse: 0.1
+  lambda_medium: 0.3
+  lambda_fine: 0.6
+  # KL par dimension — seuils diagnostics
+  kl_collapse_threshold: 0.5
+  kl_explosion_threshold: 10.0
+
+# --- β Scheduling (3 phases fixes) ---
+beta:
+  phase1_end: 30           # epochs 1-30 : β=0
+  phase2_end: 130          # epochs 31-130 : warm-up linéaire 0→4
+  beta_final: 4.0          # epochs 131-300 : β=4.0
+
+# --- Entraînement ---
+training:
+  epochs: 300
+  batch_size: 32
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+  optimizer: "adamw"
+  # Checkpoints
+  checkpoint_dir: "checkpoints"
+  best_model_path: "checkpoints/best_model.pth"
+  last_model_path: "checkpoints/last_model.pth"
+
+# --- Score d'Anomalie ---
+scoring:
+  weights:
+    recon: 0.4
+    kl: 0.2
+    heatmap: 0.3
+    latent: 0.1
+  threshold_percentile: 95
+  heatmap_sigma: 1.5       # Lissage gaussien
+  heatmap_size: 64         # Résolution finale heatmap
+  inference_samples: 10    # Moyenne de N échantillons à l'inférence
+
+# --- Logging / WandB ---
+logging:
+  use_wandb: false         # Passer à true pour activer WandB
+  project: "sparse-vae-forgery"
+  log_interval: 10         # Log tous les N batches

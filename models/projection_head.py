@@ -1,68 +1,88 @@
 """
 models/projection_head.py
-=========================
-Étape ② — Projection Head
-Compresse les patch tokens DINOv2 (B, 256, 768) vers μ et log σ² (B, 64).
-Seule partie entraînable côté encodeur.
-"""
+Projection Head : tokens DINOv2 (B, 256, 768) → μ, log σ² (B, 64).
 
+C'est la seule partie entraînable côté encodeur.
+"""
 import torch
 import torch.nn as nn
 
 
 class ProjectionHead(nn.Module):
     """
-    Encodeur VAE : patch tokens DINOv2 → (μ, log σ²).
+    Comprime les 256 patch tokens DINOv2 vers les paramètres (μ, log σ²)
+    de la distribution latente VAE.
 
     Architecture :
-        Mean pool → FC(768,512)+LN+GELU → Dropout →
-        FC(512,256)+LN+GELU → Dropout →
-        Tête μ : FC(256,64)
-        Tête log σ² : FC(256,64) + Clamp(-4,4)
+        Mean pooling → FC(768→512)+LN+GELU → Dropout → 
+        FC(512→256)+LN+GELU → Dropout → Têtes μ et log σ²
+
+    Args:
+        input_dim   : dimension des tokens DINOv2 (768 pour ViT-B)
+        hidden_dim1 : première couche cachée (512)
+        hidden_dim2 : deuxième couche cachée (256)
+        latent_dim  : dimension de l'espace latent (64)
+        dropout     : taux de dropout (0.1)
+        logvar_clamp: bornes pour le clamping de log σ² ([-4, 4])
     """
 
-    def __init__(self, input_dim: int = 768, hidden_dims: list = None,
-                 latent_dim: int = 64, dropout: float = 0.1,
+    def __init__(self,
+                 input_dim: int = 768,
+                 hidden_dim1: int = 512,
+                 hidden_dim2: int = 256,
+                 latent_dim: int = 64,
+                 dropout: float = 0.1,
                  logvar_clamp: tuple = (-4.0, 4.0)):
         super().__init__()
-        if hidden_dims is None:
-            hidden_dims = [512, 256]
 
-        self.logvar_clamp = logvar_clamp
+        self.logvar_min, self.logvar_max = logvar_clamp
 
-        # Trunk partagé
-        self.trunk = nn.Sequential(
-            nn.Linear(input_dim, hidden_dims[0]),
-            nn.LayerNorm(hidden_dims[0]),
+        # --- Backbone de projection ---
+        self.encoder = nn.Sequential(
+            # Couche 1 : 768 → 512
+            nn.Linear(input_dim, hidden_dim1),
+            nn.LayerNorm(hidden_dim1),
             nn.GELU(),
             nn.Dropout(p=dropout),
-            nn.Linear(hidden_dims[0], hidden_dims[1]),
-            nn.LayerNorm(hidden_dims[1]),
+            # Couche 2 : 512 → 256
+            nn.Linear(hidden_dim1, hidden_dim2),
+            nn.LayerNorm(hidden_dim2),
             nn.GELU(),
             nn.Dropout(p=dropout),
         )
 
-        # Têtes de sortie
-        self.mu_head = nn.Linear(hidden_dims[1], latent_dim)
-        self.logvar_head = nn.Linear(hidden_dims[1], latent_dim)
+        # Têtes séparées pour μ et log σ²
+        self.fc_mu     = nn.Linear(hidden_dim2, latent_dim)
+        self.fc_logvar = nn.Linear(hidden_dim2, latent_dim)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        """Initialisation Xavier pour une convergence stable."""
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
 
     def forward(self, patch_tokens: torch.Tensor):
         """
         Args:
-            patch_tokens : (B, 256, 768) — sortie DINOv2 sans CLS token
+            patch_tokens : (B, 256, 768) — patch tokens DINOv2
 
         Returns:
-            mu     : (B, latent_dim)
-            logvar : (B, latent_dim)  — log σ², clampé dans [-4, 4]
+            mu     : (B, 64) — moyenne de q(z|x)
+            logvar : (B, 64) — log-variance de q(z|x)
         """
-        # Mean pooling spatial : (B, 256, 768) → (B, 768)
+        # Agrégation spatiale : mean pooling sur les 256 patches → (B, 768)
         x = patch_tokens.mean(dim=1)
 
-        # Trunk
-        h = self.trunk(x)
+        # Projection vers l'espace intermédiaire
+        h = self.encoder(x)   # (B, 256)
 
-        # Têtes
-        mu = self.mu_head(h)
-        logvar = self.logvar_head(h).clamp(*self.logvar_clamp)
+        # Paramètres de la distribution
+        mu     = self.fc_mu(h)      # (B, 64) — ∈ ℝ, pas d'activation
+        logvar = self.fc_logvar(h)  # (B, 64) — clampé pour stabilité numérique
+        logvar = torch.clamp(logvar, self.logvar_min, self.logvar_max)
 
         return mu, logvar

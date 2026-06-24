@@ -1,120 +1,270 @@
 """
 models/sparse_latent.py
-=======================
-Étape ③ — Sparse Latent Space
-Reparametrization trick + Top-K hard sparsity + KL divergence.
-Cœur de la contribution du pipeline.
-"""
+Couche Latente Sparse + Contrôleur Adaptatif K.
 
+Contribution principale :
+  - Reparametrization trick (entraînement stochastique / inférence stable)
+  - Top-K hard sparsity avec straight-through estimator
+  - AdaptiveKController : apprend automatiquement K à partir de la KL par dim
+    et de la reconstruction loss — sans jamais fixer K manuellement.
+"""
 import torch
 import torch.nn as nn
 
 
-def reparameterize(mu: torch.Tensor, logvar: torch.Tensor,
-                   training: bool = True, n_samples: int = 10) -> torch.Tensor:
+# =============================================================================
+# Reparametrization Trick
+# =============================================================================
+
+def reparameterize(mu: torch.Tensor,
+                   logvar: torch.Tensor,
+                   training: bool = True,
+                   n_samples: int = 10) -> torch.Tensor:
     """
-    Reparametrization trick : z = mu + sigma * epsilon.
-    Différentiable par rapport à mu et logvar.
+    Reparametrization trick : z = μ + σ ⊙ ε, ε ~ N(0, I).
+    Différentiable par rapport à μ et logvar.
 
-    Entraînement : un seul échantillon (efficace).
-    Inférence    : moyenne de n_samples pour stabilité.
-    """
-    std = torch.exp(0.5 * logvar)
-    if training:
-        eps = torch.randn_like(std)
-        return mu + std * eps
-    else:
-        z_samples = [mu + std * torch.randn_like(std) for _ in range(n_samples)]
-        return torch.stack(z_samples).mean(dim=0)
-
-
-def top_k_sparsity(z: torch.Tensor, k: int = 16):
-    """
-    Top-K hard sparsity : garde seulement les K dimensions
-    de plus forte magnitude, met les autres à zéro.
-
-    Gradient : straight-through estimator (backward non bloqué).
+    En inférence : moyenne de n_samples échantillons pour la stabilité.
 
     Args:
-        z : (B, latent_dim)
-        k : nombre de dimensions actives
+        mu       : (B, D)
+        logvar   : (B, D)
+        training : bool
+        n_samples: nombre d'échantillons en inférence
 
     Returns:
-        z_sparse : (B, latent_dim) — seulement K dims ≠ 0
-        mask     : (B, latent_dim) — binaire 0/1
+        z : (B, D)
     """
-    z_abs = z.abs()
+    std = torch.exp(0.5 * logvar)   # σ = exp(0.5 × log σ²)
 
-    # Seuil = K-ième plus grande valeur par sample
-    threshold, _ = z_abs.topk(k, dim=1)          # (B, K)
-    threshold = threshold[:, -1:]                  # (B, 1)
+    if training:
+        eps = torch.randn_like(std)  # ε ~ N(0, I)
+        return mu + std * eps
+    else:
+        # Moyenne de n_samples pour réduire la variance en inférence
+        samples = [mu + std * torch.randn_like(std) for _ in range(n_samples)]
+        return torch.stack(samples, dim=0).mean(dim=0)
 
-    # Masque binaire
-    mask = (z_abs >= threshold).float()            # (B, latent_dim)
 
-    # Application du masque (straight-through : gradient passe entier)
+# =============================================================================
+# Top-K Hard Sparsity
+# =============================================================================
+
+def top_k_sparsity(z: torch.Tensor, k: int):
+    """
+    Applique une sparsité Top-K sur z.
+    Seules les K dimensions de plus forte magnitude sont conservées.
+
+    Gradient : straight-through estimator (le gradient passe intégralement).
+
+    Args:
+        z : (B, D) — vecteur latent dense
+        k : nombre de dimensions à conserver
+
+    Returns:
+        z_sparse : (B, D) — z avec D-K dimensions mises à zéro
+        mask     : (B, D) — masque binaire (1 = actif, 0 = zéro)
+    """
+    k = max(1, min(k, z.shape[1]))  # Sécurité : k ∈ [1, D]
+
+    z_abs = z.abs()   # (B, D)
+
+    # Trouver la K-ième plus grande valeur par ligne → seuil
+    topk_vals, _ = z_abs.topk(k, dim=1)        # (B, K)
+    threshold = topk_vals[:, -1:].detach()      # (B, 1) — la plus petite des K
+
+    # Masque binaire : 1 pour les K dims actives
+    mask = (z_abs >= threshold).float()          # (B, D)
+
+    # Application du masque — straight-through : gradient non masqué en backward
     z_sparse = z * mask
 
     return z_sparse, mask
 
 
+# =============================================================================
+# KL Divergence — par dimension et totale
+# =============================================================================
+
+def kl_divergence(mu: torch.Tensor,
+                  logvar: torch.Tensor):
+    """
+    KL(q(z|x) || N(0,I)) par dimension et totale.
+
+    KL_i = -0.5 × (1 + log σ_i² - μ_i² - σ_i²)
+
+    Args:
+        mu     : (B, D)
+        logvar : (B, D)
+
+    Returns:
+        kl_loss    : scalaire — moyenne sur batch et dimensions
+        kl_per_dim : (D,)    — KL par dimension (moyenne sur le batch)
+    """
+    # KL par (batch, dim) : (B, D)
+    kl_bd = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())
+
+    # Par dimension : moyenne sur le batch → (D,)
+    kl_per_dim = kl_bd.mean(dim=0)
+
+    # Scalaire : somme sur D puis moyenne sur B
+    kl_loss = kl_bd.sum(dim=1).mean()
+
+    return kl_loss, kl_per_dim
+
+
+# =============================================================================
+# Contrôleur Adaptatif K
+# =============================================================================
+
+class AdaptiveKController:
+    """
+    Apprend automatiquement la meilleure valeur de K à chaque époque.
+
+    Logique :
+      1. Calculer τ = max(tau_fraction × KL_mean, tau_min)
+      2. Compter les dimensions informatives : KL_i > τ → K_target
+      3. Ajuster selon la reconstruction : si recon élevée → augmenter K
+      4. Contraindre K ∈ [K_min, K_max]
+      5. Appliquer via EMA pour éviter les oscillations
+
+    Args:
+        K_init      : valeur initiale de K (8)
+        K_min       : valeur minimale (2)
+        K_max       : valeur maximale (50)
+        tau_fraction: fraction de KL_mean pour le seuil (0.1)
+        tau_min     : seuil minimum (1e-4)
+        recon_high  : seuil reconstruction pour augmenter K (0.05)
+        recon_low   : seuil reconstruction pour réduire K (0.01)
+        recon_step  : pas d'adaptation en K (2)
+        ema_alpha   : coefficient EMA (0.9) — proche de 1 = évolution lente
+    """
+
+    def __init__(self,
+                 K_init: int = 8,
+                 K_min: int = 2,
+                 K_max: int = 50,
+                 tau_fraction: float = 0.1,
+                 tau_min: float = 1e-4,
+                 recon_high: float = 0.05,
+                 recon_low: float = 0.01,
+                 recon_step: int = 2,
+                 ema_alpha: float = 0.9):
+        self.K = float(K_init)   # Float pour l'EMA
+        self.K_min = K_min
+        self.K_max = K_max
+        self.tau_fraction = tau_fraction
+        self.tau_min = tau_min
+        self.recon_high = recon_high
+        self.recon_low  = recon_low
+        self.recon_step = recon_step
+        self.ema_alpha  = ema_alpha
+
+        self._K_ema = float(K_init)    # EMA interne
+
+    @property
+    def current_K(self) -> int:
+        """K courant entier (utilisé dans top_k_sparsity)."""
+        return int(round(self._K_ema))
+
+    def update(self,
+               kl_per_dim: torch.Tensor,
+               recon_loss: float) -> int:
+        """
+        Met à jour K à partir des diagnostics de l'époque.
+
+        Args:
+            kl_per_dim : (D,) — KL par dimension (moyenne sur le batch/époque)
+            recon_loss : scalaire float — reconstruction loss de validation
+
+        Returns:
+            K courant (entier)
+        """
+        kl_np = kl_per_dim.detach().cpu().float()
+
+        # --- Étape 1 : Calcul de τ ---
+        kl_mean = kl_np.mean().item()
+        tau = max(self.tau_fraction * kl_mean, self.tau_min)
+
+        # --- Étape 2 : Compter les dimensions informatives ---
+        n_informative = int((kl_np > tau).sum().item())
+        K_target = float(n_informative)
+
+        # --- Étape 3 : Ajuster selon la reconstruction ---
+        if recon_loss > self.recon_high:
+            K_target += self.recon_step   # Reconstruction mauvaise → plus de dims
+        elif recon_loss < self.recon_low:
+            K_target -= self.recon_step   # Reconstruction trop facile → moins de dims
+
+        # --- Étape 4 : Contraindre dans [K_min, K_max] ---
+        K_target = float(max(self.K_min, min(self.K_max, K_target)))
+
+        # --- Étape 5 : EMA pour évolution progressive ---
+        # K_new = α × K_old + (1-α) × K_target
+        self._K_ema = self.ema_alpha * self._K_ema + (1.0 - self.ema_alpha) * K_target
+
+        # Contraindre à nouveau après EMA
+        self._K_ema = max(float(self.K_min), min(float(self.K_max), self._K_ema))
+
+        return self.current_K
+
+    def state_dict(self) -> dict:
+        return {"K_ema": self._K_ema}
+
+    def load_state_dict(self, state: dict):
+        self._K_ema = state["K_ema"]
+
+
+# =============================================================================
+# Couche Latente Sparse
+# =============================================================================
+
 class SparseLatentLayer(nn.Module):
     """
-    Couche latente sparse d'un β-VAE.
+    Couche latente combinant :
+      - Reparametrization trick
+      - Top-K hard sparsity (K adaptatif)
+      - Calcul de la KL divergence par dimension
 
-    Étapes :
-        1. Reparametrization trick → z
-        2. Top-K sparsity         → z_sparse, mask
-        3. KL divergence          → kl_loss (sur z original)
+    Args:
+        latent_dim : dimension de l'espace latent (64)
+        K_init     : valeur initiale de K (8)
     """
 
-    def __init__(self, latent_dim: int = 64, k: int = 16):
+    def __init__(self,
+                 latent_dim: int = 64,
+                 K_init: int = 8):
         super().__init__()
         self.latent_dim = latent_dim
-        self.k = k
+        self._k = K_init
+
+    @property
+    def k(self) -> int:
+        return self._k
+
+    @k.setter
+    def k(self, value: int):
+        self._k = max(1, min(value, self.latent_dim))
 
     def forward(self, mu: torch.Tensor, logvar: torch.Tensor):
         """
         Args:
-            mu     : (B, latent_dim)
-            logvar : (B, latent_dim)
+            mu     : (B, D) — moyenne de q(z|x)
+            logvar : (B, D) — log-variance de q(z|x)
 
         Returns:
-            z_sparse : (B, latent_dim)  — K dims actives
-            kl_loss  : scalaire         — KL(q||p) moyenne sur batch
-            mask     : (B, latent_dim)  — pour monitoring LEA
+            z_sparse   : (B, D) — vecteur latent sparse
+            kl_loss    : scalaire — KL totale (pour la loss)
+            kl_per_dim : (D,)   — KL par dimension (pour AdaptiveKController)
+            mask       : (B, D) — masque Top-K
         """
-        # 1. Échantillonnage différentiable
+        # 1. Reparametrization trick
         z = reparameterize(mu, logvar, training=self.training)
 
-        # 2. Sparsité Top-K
-        z_sparse, mask = top_k_sparsity(z, self.k)
+        # 2. Top-K sparsity
+        z_sparse, mask = top_k_sparsity(z, k=self._k)
 
-        # 3. KL divergence (calculée sur z avant sparsité)
-        #    KL(N(μ,σ²) || N(0,I)) = -0.5 * Σ(1 + logσ² - μ² - σ²)
-        kl_loss = -0.5 * torch.sum(
-            1 + logvar - mu.pow(2) - logvar.exp(), dim=1
-        ).mean()
+        # 3. KL divergence (calculée sur z original, pas z_sparse)
+        kl_loss, kl_per_dim = kl_divergence(mu, logvar)
 
-        return z_sparse, kl_loss, mask
-
-    # ------------------------------------------------------------------ #
-    #  Métriques LEA (Latent Efficiency Analysis) — pour monitoring W&B   #
-    # ------------------------------------------------------------------ #
-
-    def active_ratio(self, mask: torch.Tensor) -> float:
-        """Fraction moyenne de dimensions actives sur le batch. Cible : ~0.25"""
-        return mask.float().mean().item()
-
-    def sparsity_rate(self, mask: torch.Tensor) -> float:
-        """Fraction de dimensions NON actives (zéro). Cible : ~0.75"""
-        return 1.0 - self.active_ratio(mask)
-
-    def latent_entropy(self, mask: torch.Tensor) -> float:
-        """Entropie sur les activations — mesure de diversité."""
-        p = mask.float().mean(dim=0).clamp(1e-8, 1 - 1e-8)  # (latent_dim,)
-        return (-p * p.log() - (1 - p) * (1 - p).log()).mean().item()
-
-    def variance_per_dim(self, z_sparse: torch.Tensor) -> torch.Tensor:
-        """Variance par dimension sur le batch. Toutes > 0.001 = pas de dim morte."""
-        return z_sparse.var(dim=0)   # (latent_dim,)
+        return z_sparse, kl_loss, kl_per_dim, mask

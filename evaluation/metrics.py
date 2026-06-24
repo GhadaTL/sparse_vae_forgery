@@ -1,65 +1,115 @@
-# evaluation/metrics.py
-import torch
+"""
+evaluation/metrics.py
+Calcul des métriques d'évaluation de détection d'anomalies.
+"""
+import json
+import csv
+from pathlib import Path
+
+import numpy as np
+from sklearn.metrics import (
+    roc_auc_score, precision_score, recall_score,
+    f1_score, confusion_matrix, roc_curve
+)
 
 
-@torch.no_grad()
-def validate_projection_head(model, val_loader, device):
+def compute_all_metrics(scores: np.ndarray,
+                        labels: np.ndarray,
+                        threshold: float = None) -> dict:
     """
-    CDC §2.6 — validation de la projection head.
-    Forward pass arrêté après ProjectionHead.
-    Décodeur et SparseLatent ne sont pas appelés.
+    Calcule toutes les métriques de détection.
+
+    Args:
+        scores    : (N,) scores d'anomalie (plus haut = plus suspect)
+        labels    : (N,) labels vrais (0=authentique, 1=forgé)
+        threshold : seuil θ (si None, utilise le meilleur F1)
+
+    Returns:
+        dict avec AUC-ROC, Precision, Recall, F1, Threshold, Confusion Matrix
     """
-    all_mu, all_logvar = [], []
+    # AUC-ROC
+    auc = roc_auc_score(labels, scores)
 
-    model.eval()  # désactive Dropout dans ProjectionHead
+    # Seuil optimal (meilleur F1 si non fourni)
+    if threshold is None:
+        fpr, tpr, thresholds = roc_curve(labels, scores)
+        f1s = [f1_score(labels, (scores >= t).astype(int), zero_division=0)
+               for t in thresholds]
+        best_idx = int(np.argmax(f1s))
+        threshold = float(thresholds[best_idx])
 
-    for x, _ in val_loader:
-        x      = x.to(device)
+    preds = (scores >= threshold).astype(int)
 
-        # ── Forward partiel : s'arrête après ProjectionHead ──
-        tokens      = model.dinov2(x)                # étape 1
-        mu, log_var = model.projection_head(tokens)  # étape 2
-        # ── On n'appelle pas plus loin ────────────────────────
+    precision = precision_score(labels, preds, zero_division=0)
+    recall    = recall_score(labels, preds, zero_division=0)
+    f1        = f1_score(labels, preds, zero_division=0)
+    cm        = confusion_matrix(labels, preds).tolist()
 
-        all_mu.append(mu.cpu())
-        all_logvar.append(log_var.cpu())
+    tn, fp, fn, tp = confusion_matrix(labels, preds).ravel()
 
-    mu_all     = torch.cat(all_mu,     dim=0)  # (N, 64)
-    logvar_all = torch.cat(all_logvar, dim=0)  # (N, 64)
-
-    # ── Critère 1 : µ_moyen ≈ 0, σ²_moyen ≈ 1 ───────────────
-    mu_moyen  = mu_all.mean().item()
-    var_moyen = logvar_all.exp().mean().item()
-
-    # ── Critère 2 : KL ∈ [2, 10] nats ────────────────────────
-    kl = -0.5 * torch.sum(
-        1 + logvar_all - mu_all.pow(2) - logvar_all.exp(),
-        dim=1
-    ).mean().item()
-
-    # ── Critère 3 : Var(µ_i) > 0.01 pour tout i ──────────────
-    var_dims    = mu_all.var(dim=0)           # (64,)
-    n_collapsed = (var_dims < 0.01).sum().item()
-
-    # ── Affichage ─────────────────────────────────────────────
-    print(f"  µ_moyen     = {mu_moyen:.4f}   (cible ≈ 0)")
-    print(f"  σ²_moyen    = {var_moyen:.4f}   (cible ≈ 1)")
-    print(f"  KL moyenne  = {kl:.3f} nats  (cible 2–10)")
-    print(f"  Dims mortes = {n_collapsed}/64  (cible = 0)")
-
-    # ── Décision ──────────────────────────────────────────────
-    ok_phase1 = (
-        abs(mu_moyen)        < 0.5 and
-        abs(var_moyen - 1.0) < 0.5 and
-        n_collapsed          == 0
-    )
-    ok_phase3 = ok_phase1 and (2.0 <= kl <= 10.0)
-
-    return {
-        "mu_moyen":    mu_moyen,
-        "var_moyen":   var_moyen,
-        "kl_moyen":    kl,
-        "n_collapsed": n_collapsed,
-        "ok_phase1":   ok_phase1,   # sans critère KL
-        "ok_phase3":   ok_phase3,   # avec critère KL
+    metrics = {
+        "auc_roc":   float(auc),
+        "precision": float(precision),
+        "recall":    float(recall),
+        "f1_score":  float(f1),
+        "threshold": float(threshold),
+        "confusion_matrix": cm,
+        "TP": int(tp),
+        "TN": int(tn),
+        "FP": int(fp),
+        "FN": int(fn),
+        "n_forged":    int(labels.sum()),
+        "n_authentic": int((labels == 0).sum()),
     }
+    return metrics
+
+
+def print_metrics(metrics: dict):
+    """Affiche les métriques de façon lisible."""
+    print("\n" + "=" * 50)
+    print("  RÉSULTATS D'ÉVALUATION FINALE")
+    print("=" * 50)
+    print(f"  AUC-ROC    : {metrics['auc_roc']:.4f}")
+    print(f"  Precision  : {metrics['precision']:.4f}")
+    print(f"  Recall     : {metrics['recall']:.4f}")
+    print(f"  F1-Score   : {metrics['f1_score']:.4f}")
+    print(f"  Threshold  : {metrics['threshold']:.4f}")
+    print(f"  TP={metrics['TP']}  TN={metrics['TN']}  FP={metrics['FP']}  FN={metrics['FN']}")
+    print(f"\n  Matrice de confusion :")
+    cm = metrics["confusion_matrix"]
+    print(f"    [[TN={cm[0][0]}, FP={cm[0][1]}],")
+    print(f"     [FN={cm[1][0]}, TP={cm[1][1]}]]")
+    print("=" * 50 + "\n")
+
+
+def save_scores_csv(scores: np.ndarray,
+                    labels: np.ndarray,
+                    paths: list,
+                    output_path: str):
+    """
+    Sauvegarde les scores d'anomalie de chaque image dans un CSV.
+
+    Colonnes : path, true_label, anomaly_score, predicted_label
+    """
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w", newline="") as f:
+        writer = csv.DictWriter(
+            f, fieldnames=["path", "true_label", "anomaly_score", "predicted_label"]
+        )
+        writer.writeheader()
+        for path, label, score in zip(paths, labels, scores):
+            writer.writerow({
+                "path":             path,
+                "true_label":       int(label),
+                "anomaly_score":    f"{score:.6f}",
+                "predicted_label":  int(score > 0),   # provisoire, sera recalibré
+            })
+    print(f"[Scores] Sauvegardé dans {output_path}")
+
+
+def save_metrics_json(metrics: dict, output_path: str):
+    """Sauvegarde les métriques en JSON."""
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w") as f:
+        json.dump(metrics, f, indent=2)
+    print(f"[Métriques] Sauvegardé dans {output_path}")
